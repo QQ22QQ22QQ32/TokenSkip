@@ -87,6 +87,12 @@ python ./LLMLingua.py
 ```
 
 > The compressed CoTs will be stored in `outputs/.../Compression`.
+>
+> **New!** `LLMLingua.py` now accepts optional entropy-based knobs for force-preserving high-value reasoning tokens.  You can
+> provide an `entropy_threshold` (or `entropy_keep_topk`) together with the `token_stats_field` name and an optional
+> `cot_token_count` limit when calling `LLMLingua`, `compress_cot_outputs`, or `data_processing_gsm8k`.  When enabled, the
+> compressor automatically reads per-token entropy statistics from your dataset, derives dynamic `force_tokens` for the
+> prompt compressor, and can log the applied policy via `record_entropy_policy=True` for auditing purposes.
 
 **3.Convert training data to LLaMA-Factory format**
 
