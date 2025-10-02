@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import torch.nn.functional as F
 import random
 import argparse
 import numpy as np
@@ -38,6 +39,70 @@ def read_data(path):
     else:
         raise NotImplementedError()
     return data
+
+def compute_token_stats(model, tokenizer, prompts, completions, cot_lengths, batch_size=8):
+    model.eval()
+    stats = []
+    device = next(model.parameters()).device
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must have a pad token or eos token id to compute token statistics.")
+
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start:start + batch_size]
+        batch_completions = completions[start:start + batch_size]
+        batch_cot_lengths = cot_lengths[start:start + batch_size]
+
+        prompt_ids = [tokenizer.encode(prompt, add_special_tokens=False) for prompt in batch_prompts]
+        completion_ids = [tokenizer.encode(completion, add_special_tokens=False) for completion in batch_completions]
+        combined_ids = [p_ids + c_ids for p_ids, c_ids in zip(prompt_ids, completion_ids)]
+
+        if len(combined_ids) == 0:
+            continue
+
+        max_length = max(len(ids) for ids in combined_ids)
+        input_ids = torch.full((len(combined_ids), max_length), pad_token_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(combined_ids), max_length), dtype=torch.long, device=device)
+
+        for idx, ids in enumerate(combined_ids):
+            seq_len = len(ids)
+            input_ids[idx, :seq_len] = torch.tensor(ids, dtype=torch.long, device=device)
+            attention_mask[idx, :seq_len] = 1
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            log_probs = F.log_softmax(outputs.logits, dim=-1)
+
+        for idx, (p_ids, c_ids, cot_len) in enumerate(zip(prompt_ids, completion_ids, batch_cot_lengths)):
+            completion_len = len(c_ids)
+            if completion_len == 0:
+                stats.append({
+                    'completion_token_ids': [],
+                    'completion_tokens': [],
+                    'completion_logprobs': [],
+                    'completion_entropies': [],
+                    'cot_token_count': 0,
+                })
+                continue
+
+            prompt_len = len(p_ids)
+            start_pos = prompt_len - 1 if prompt_len > 0 else 0
+            end_pos = start_pos + completion_len
+
+            step_log_probs = log_probs[idx, start_pos:end_pos, :]
+            target_ids = torch.tensor(c_ids, dtype=torch.long, device=device)
+            completion_log_probs = step_log_probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)
+            completion_entropies = -(step_log_probs.exp() * step_log_probs).sum(dim=-1)
+
+            stats.append({
+                'completion_token_ids': c_ids,
+                'completion_tokens': tokenizer.convert_ids_to_tokens(c_ids),
+                'completion_logprobs': completion_log_probs.detach().cpu().tolist(),
+                'completion_entropies': completion_entropies.detach().cpu().tolist(),
+                'cot_token_count': min(int(cot_len), completion_len),
+            })
+
+    return stats
 
 def infer(args, test_data, answer_extraction_fn):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
@@ -136,20 +201,50 @@ def infer(args, test_data, answer_extraction_fn):
     cot_lengths = []
     for model_completion in model_outputs:
         cot = model_completion.split('\n\nThe final answer is:')[0]
-        cot_length = tokenizer(cot, return_tensors="pt")['input_ids'].shape[1]
+        cot_length = len(tokenizer.encode(cot, add_special_tokens=False))
         cot_lengths.append(cot_length)
 
+    token_stats = None
+    if args.collect_token_stats:
+        hf_model = None
+        if args.use_vllm:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.model_path,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                device_map="auto",
+            )
+            if args.use_adapter:
+                hf_model = PeftModel.from_pretrained(hf_model, args.adapter_path, device_map="auto")
+                hf_model = hf_model.merge_and_unload()
+        else:
+            hf_model = model
+
+        token_stats = compute_token_stats(
+            hf_model,
+            tokenizer,
+            prompts,
+            model_outputs,
+            cot_lengths,
+            batch_size=max(1, args.token_stats_batch_size),
+        )
+
+        if args.use_vllm:
+            del hf_model
+    
     predictions = [eval(answer_extraction_fn)(item['messages'][-2]['content'], output, task='cot') for item, output in tqdm(zip(test_data, model_outputs), desc="extract answer", total=len(model_outputs))]
     assert len(model_outputs) > 0, f"{len(model_outputs)}"
 
     results = []
-    for example, output, pred, cot_length in zip(test_data, model_outputs, predictions, cot_lengths):
+    for idx, (example, output, pred, cot_length) in enumerate(zip(test_data, model_outputs, predictions, cot_lengths)):
         item = deepcopy(example)
         item.update({
             'model_output': output,
             'prediction': pred,
             'cot_length': cot_length,
         })
+        if token_stats is not None:
+            item['token_stats'] = token_stats[idx]
         results.append(item)
     return results, total_time
 
@@ -167,6 +262,8 @@ if __name__ == "__main__":
     parser.add_argument("--benchmark", type=str, choices=['gsm8k', 'math'], default="gsm8k")
     parser.add_argument("--data-type", type=str, choices=['train', 'test'], default="test")
     parser.add_argument("--use_vllm", action='store_true', default=False, help="whether to use vllm")
+    parser.add_argument("--collect_token_stats", action='store_true', default=False, help="collect per-token statistics for model completions")
+    parser.add_argument("--token_stats_batch_size", type=int, default=4, help="batch size to use when computing token statistics")
 
     parser.add_argument("--max_num_examples", type=int, default=100000000000000, help="maximum number of examples to evaluate.")
     parser.add_argument("--max_new_tokens", type=int, default=512)
